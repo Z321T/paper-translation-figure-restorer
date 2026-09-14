@@ -1,6 +1,6 @@
 ---
 name: paper-translation-figure-restorer
-description: Use when an original academic PDF and an existing translated Markdown document are supplied and a missing figure or image is caption-only or needs restoration.
+description: Use when the user asks to add, restore, recover, or repair missing substantive figures or caption-only figure placeholders in an existing translated Markdown document paired with its original academic PDF; do not use for decorative images.
 ---
 
 # Paper Translation Figure Restorer
@@ -76,8 +76,10 @@ PDF page containing a figure, including pages with vector graphics, composite
 panels, code blocks, plots, or page-native text. The complete boundary excludes
 nearby body text, page furniture, adjacent figures, and captions unless the
 caption is integral to the visual. Preserve a multi-panel composite as one
-asset unless panels are independently numbered. For a figure spanning pages,
-emit ordered assets and one insertion block with a shared identifier.
+asset unless panels are independently numbered. V1 cannot represent a multi-page
+figure. Mark any figure spanning pages as `blocked` with a reason for manual or
+task-specific handling; do not invent ordered assets or a shared insertion
+block.
 
 Coordinate helpers and embedded-image enumeration may help measure a visually
 selected rectangle, but a successful helper run is not evidence that a crop is
