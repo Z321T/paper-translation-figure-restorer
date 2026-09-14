@@ -67,7 +67,7 @@ For multi-panel figures, preserve the complete composite as one asset unless the
 
 Represent approved crops in a manifest containing at least figure ID, one-based PDF page, PDF-point bounding box, insertion anchor, insertion position, output filename, and alt text. Default to inserting the image immediately before its matched translated caption; allow `after` only when the document's established structure requires it.
 
-A bundled helper validates the manifest, renders crops at a readable resolution, writes assets through a staging directory, inserts marked image blocks into a copy of the Markdown, and writes a coverage report. It must reject path traversal, invalid pages, non-finite/out-of-page rectangles, duplicate figure IDs, ambiguous or missing anchors, output/input path collisions, and asset names outside the sibling asset directory.
+A bundled helper validates the manifest, renders crops at a readable resolution, writes assets through a staging directory, inserts marked image blocks into a copy of the Markdown, and writes a coverage report. It must reject path traversal, invalid pages, non-finite/out-of-page rectangles, duplicate figure IDs, ambiguous or missing anchors, output/input path collisions unless explicit in-place mode is active, and asset names outside the sibling asset directory.
 
 Repeated execution against its own output must be idempotent: update or preserve the marked block instead of inserting a duplicate.
 
