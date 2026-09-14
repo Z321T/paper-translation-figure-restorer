@@ -1,0 +1,17 @@
+[project]
+name = "paper-translation-figure-restorer"
+version = "0.1.0"
+description = "A local Codex skill for restoring figures in translated paper Markdown"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pymupdf>=1.28.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

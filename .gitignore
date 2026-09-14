@@ -1,1 +1,20 @@
 .worktrees/
+
+# Local environments and tool caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration (keep .env.example files reviewable)
+.env
+.env.*
+!.env.example
+
+# Generated acceptance artifacts
+acceptance/
+acceptance-output/
+acceptance_output/
+generated-acceptance/
