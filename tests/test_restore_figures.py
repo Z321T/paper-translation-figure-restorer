@@ -11,6 +11,7 @@ import pytest
 
 from restore_figures import (
     FigureSpec,
+    Manifest,
     RestorationError,
     load_manifest,
     render_figure_crops,
@@ -108,15 +109,15 @@ def test_valid_crop_has_hand_derived_dimensions_and_page_native_pixels(
 
 
 @pytest.mark.parametrize(
-    ("figures", "message"),
+    ("figures", "expected_message"),
     [
         (
             [_restore(), _restore(figure_id="figure-1", filename="figure-002.png")],
-            "duplicate figure IDs",
+            "figure IDs must be unique",
         ),
         (
             [_restore(), _restore(figure_id="figure-2")],
-            "duplicate generated filenames",
+            "generated asset filenames must be unique",
         ),
     ],
 )
@@ -126,18 +127,15 @@ def test_duplicate_ids_and_filenames_are_rejected(
     translated_markdown: str,
     assets_dir: Path,
     figures: list[dict[str, object]],
-    message: str,
+    expected_message: str,
 ) -> None:
     """Catches mutations that overwrite one figure with another silently."""
 
     manifest = load_manifest(_manifest_file(tmp_path, figures))
-    _assert_category(
-        lambda: validate_manifest(
-            manifest, pdf_document, translated_markdown, assets_dir
-        ),
-        "manifest",
-    )
-    assert message
+    with pytest.raises(RestorationError) as caught:
+        validate_manifest(manifest, pdf_document, translated_markdown, assets_dir)
+    assert caught.value.category == "manifest"
+    assert caught.value.message == expected_message
 
 
 def test_unknown_status_is_rejected_without_echoing_manifest_content(
@@ -507,3 +505,200 @@ def test_loader_rejects_wrong_version_extra_keys_and_malformed_json(
     malformed = tmp_path / "malformed.json"
     malformed.write_text('{"version": 1,', encoding="utf-8")
     _assert_category(lambda: load_manifest(malformed), "input")
+
+
+def test_manifest_bbox_overflow_is_sanitized_at_json_boundary(tmp_path: Path) -> None:
+    """Catches a float conversion that leaks OverflowError from manifest loading."""
+
+    path = tmp_path / "overflow-manifest.json"
+    # Keep under Python's JSON integer digit guard while still overflowing float().
+    huge_integer = "1" + "0" * 4000
+    path.write_text(
+        '{"version":1,"figures":[{"id":"figure-1","status":"restore",'
+        '"page":1,"bbox":['
+        + huge_integer
+        + ',50,240,150],"anchor":"anchor","filename":"figure.png",'
+        '"alt":"figure"}]}',
+        encoding="utf-8",
+    )
+    _assert_category(
+        lambda: load_manifest(path),
+        "manifest",
+    )
+
+
+def test_direct_manifest_bbox_overflow_is_sanitized_at_validation_boundary(
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches a direct FigureSpec float conversion that leaks OverflowError."""
+
+    spec = FigureSpec(
+        id="figure-1",
+        status="restore",
+        page=1,
+        bbox=(10**10000, 50.0, 240.0, 150.0),
+        anchor="**图 1：系统概览。**",
+        filename="figure-001.png",
+        alt="图 1：系统概览",
+    )
+    _assert_category(
+        lambda: validate_manifest(
+            Manifest(version=1, figures=(spec,)),
+            pdf_document,
+            translated_markdown,
+            assets_dir,
+        ),
+        "manifest",
+    )
+
+
+def test_dpi_overflow_is_sanitized_before_rendering(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches a DPI conversion that leaks OverflowError to callers."""
+
+    specs = _valid_specs(tmp_path, pdf_document, translated_markdown, assets_dir)
+    _assert_category(
+        lambda: render_figure_crops(pdf_document, specs, assets_dir, dpi=10**10000),
+        "render",
+    )
+
+
+def test_assets_dir_root_symlink_is_rejected_without_external_write(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+) -> None:
+    """Catches resolving an asset-root symlink and accepting its outside target."""
+
+    outside = tmp_path / "outside-assets"
+    outside.mkdir()
+    linked_root = tmp_path / "assets-link"
+    linked_root.symlink_to(outside, target_is_directory=True)
+    manifest = load_manifest(_manifest_file(tmp_path, [_restore()]))
+
+    _assert_category(
+        lambda: validate_manifest(
+            manifest, pdf_document, translated_markdown, linked_root
+        ),
+        "local_io",
+    )
+    assert not (outside / "figure-001.png").exists()
+
+
+def test_staging_assets_root_symlink_is_rejected_without_external_write(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches rendering through a staging-root symlink into a sibling directory."""
+
+    specs = _valid_specs(tmp_path, pdf_document, translated_markdown, assets_dir)
+    outside = tmp_path / "outside-staging"
+    outside.mkdir()
+    linked_root = tmp_path / "staging-link"
+    linked_root.symlink_to(outside, target_is_directory=True)
+
+    _assert_category(
+        lambda: render_figure_crops(pdf_document, specs, linked_root, dpi=144),
+        "local_io",
+    )
+    assert not (outside / "figure-001.png").exists()
+
+
+def test_escaping_symlink_component_is_rejected_without_external_write(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches accepting an existing asset path whose component resolves outside."""
+
+    outside = tmp_path / "outside-component"
+    outside.mkdir()
+    (outside / "existing.png").write_bytes(b"outside")
+    (assets_dir / "nested").symlink_to(outside, target_is_directory=True)
+    figure = {
+        "id": "figure-1",
+        "status": "already-present",
+        "existing_asset": "nested/existing.png",
+    }
+    manifest = load_manifest(_manifest_file(tmp_path, [figure]))
+
+    _assert_category(
+        lambda: validate_manifest(
+            manifest, pdf_document, translated_markdown, assets_dir
+        ),
+        "local_io",
+    )
+
+
+def test_symlink_loop_resolution_is_sanitized_as_local_io(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches leaking RuntimeError when resolving a cyclic asset symlink."""
+
+    first = assets_dir / "loop-a"
+    second = assets_dir / "loop-b"
+    first.symlink_to(second)
+    second.symlink_to(first)
+    figure = {
+        "id": "figure-1",
+        "status": "already-present",
+        "existing_asset": "loop-a",
+    }
+    manifest = load_manifest(_manifest_file(tmp_path, [figure]))
+
+    _assert_category(
+        lambda: validate_manifest(
+            manifest, pdf_document, translated_markdown, assets_dir
+        ),
+        "local_io",
+    )
+
+
+def test_validate_manifest_rejects_direct_manifest_version_bypass(
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches validation that trusts a manually constructed non-v1 Manifest."""
+
+    _assert_category(
+        lambda: validate_manifest(
+            Manifest(version=2, figures=()),
+            pdf_document,
+            translated_markdown,
+            assets_dir,
+        ),
+        "manifest",
+    )
+
+
+def test_explicit_null_occurrence_is_not_treated_as_omitted(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches permissive schema parsing that turns occurrence:null into default 1."""
+
+    figure = _restore(include_occurrence=True, occurrence=None)
+    _assert_category(
+        lambda: validate_manifest(
+            load_manifest(_manifest_file(tmp_path, [figure])),
+            pdf_document,
+            translated_markdown,
+            assets_dir,
+        ),
+        "manifest",
+    )

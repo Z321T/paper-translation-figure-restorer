@@ -129,7 +129,10 @@ def _require_string(value: object, field_name: str, *, non_empty: bool = True) -
 def _require_number(value: object, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise _error("manifest", f"manifest field {field_name} must be numeric")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise _error("manifest", f"manifest field {field_name} must be finite") from exc
     if not math.isfinite(number):
         raise _error("manifest", f"manifest field {field_name} must be finite")
     return number
@@ -175,8 +178,8 @@ def _parse_figure(raw: object) -> FigureSpec:
         filename = _require_string(item.get("filename"), "filename")
         alt = _require_string(item.get("alt"), "alt")
 
-        raw_occurrence = item.get("occurrence")
-        if raw_occurrence is not None:
+        if "occurrence" in item:
+            raw_occurrence = item["occurrence"]
             if isinstance(raw_occurrence, bool) or not isinstance(raw_occurrence, int):
                 raise _error("manifest", "manifest field occurrence must be an integer")
             occurrence: int | None = raw_occurrence
@@ -269,14 +272,34 @@ def _safe_relative_path(
 
     try:
         root_resolved = root.resolve()
-        candidate = (root_resolved.joinpath(*pure.parts)).resolve(strict=False)
+        candidate_path = root_resolved.joinpath(*pure.parts)
+        _reject_symlink_components(candidate_path)
+        candidate = candidate_path.resolve(strict=False)
     except OSError as exc:
+        raise _error("local_io", "asset path could not be resolved") from exc
+    except RuntimeError as exc:
         raise _error("local_io", "asset path could not be resolved") from exc
     except ValueError as exc:
         raise _error("manifest", "asset path could not be resolved") from exc
     if not candidate.is_relative_to(root_resolved):
         raise _error("manifest", "asset path is outside the asset directory")
     return candidate
+
+
+def _reject_symlink_components(path: Path) -> None:
+    """Reject symlink roots/components before canonicalizing untrusted paths."""
+
+    try:
+        absolute = path.absolute()
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                raise _error("local_io", "asset path contains a symlink")
+    except RestorationError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _error("local_io", "asset path could not be inspected") from exc
 
 
 def _validate_anchor(spec: FigureSpec, markdown: str) -> FigureSpec:
@@ -327,18 +350,17 @@ def _validate_restore_geometry(spec: FigureSpec, document: pymupdf.Document) -> 
         or spec.page > page_count
     ):
         raise _error("manifest", "figure page is outside the document")
-    if (
-        not isinstance(spec.bbox, (tuple, list))
-        or len(spec.bbox) != 4
-        or any(
-            isinstance(coordinate, bool)
-            or not isinstance(coordinate, numbers.Real)
-            or not math.isfinite(float(coordinate))
-            for coordinate in spec.bbox
-        )
-    ):
+    if not isinstance(spec.bbox, (tuple, list)) or len(spec.bbox) != 4:
         raise _error("manifest", "figure bbox must contain four finite numbers")
-    x0, y0, x1, y1 = (float(coordinate) for coordinate in spec.bbox)
+    if any(isinstance(coordinate, bool) or not isinstance(coordinate, numbers.Real) for coordinate in spec.bbox):
+        raise _error("manifest", "figure bbox must contain four finite numbers")
+    try:
+        coordinates = tuple(float(coordinate) for coordinate in spec.bbox)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise _error("manifest", "figure bbox must contain four finite numbers") from exc
+    if not all(math.isfinite(coordinate) for coordinate in coordinates):
+        raise _error("manifest", "figure bbox must contain four finite numbers")
+    x0, y0, x1, y1 = coordinates
     if not (x0 < x1 and y0 < y1):
         raise _error("manifest", "figure bbox must have positive width and height")
     try:
@@ -370,7 +392,14 @@ def validate_manifest(
         raise _error("input", "translated Markdown must be text")
     if not isinstance(assets_dir, Path):
         raise _error("input", "asset directory must be a Path")
+    if (
+        isinstance(manifest.version, bool)
+        or not isinstance(manifest.version, int)
+        or manifest.version != 1
+    ):
+        raise _error("manifest", "unsupported manifest version")
     try:
+        _reject_symlink_components(assets_dir)
         root = assets_dir.resolve()
         if root.exists() and not root.is_dir():
             raise _error("local_io", "asset path is not a directory")
@@ -461,7 +490,10 @@ def render_figure_crops(
         raise _error("input", "PDF document could not be accessed")
     if isinstance(dpi, bool) or not isinstance(dpi, numbers.Real):
         raise _error("render", "DPI must be a positive finite number")
-    dpi_number = float(dpi)
+    try:
+        dpi_number = float(dpi)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise _error("render", "DPI must be a positive finite number") from exc
     if (
         not math.isfinite(dpi_number)
         or dpi_number <= 0
@@ -473,6 +505,7 @@ def render_figure_crops(
         raise _error("input", "staging asset directory must be a Path")
 
     try:
+        _reject_symlink_components(staging_assets)
         staging_assets.mkdir(parents=True, exist_ok=True)
         root = staging_assets.resolve()
         if not root.is_dir():
