@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import fitz
 import pytest
+
+import restore_figures as restorer
 
 from restore_figures import (
     FigureSpec,
@@ -702,3 +708,456 @@ def test_explicit_null_occurrence_is_not_treated_as_omitted(
         ),
         "manifest",
     )
+
+
+def test_generated_marker_is_inserted_and_replaced_on_rerun(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches missing marker insertion and duplicate blocks on rerun."""
+
+    specs = _valid_specs(tmp_path, pdf_document, translated_markdown, assets_dir)
+    rendered = render_figure_crops(pdf_document, specs, assets_dir, dpi=144)
+
+    first = restorer.apply_generated_blocks(translated_markdown, rendered)
+    assert first.count("<!-- figure-restorer:start figure-1 -->") == 1
+    assert first.index("<!-- figure-restorer:start figure-1 -->") < first.index(
+        "**图 1：系统概览。**"
+    )
+
+    changed = restorer.RenderedFigure(
+        spec=replace(rendered[0].spec, filename="new-image.png"),
+        path=assets_dir / "new-image.png",
+        width=rendered[0].width,
+        height=rendered[0].height,
+    )
+    second = restorer.apply_generated_blocks(first, [changed])
+    assert second.count("<!-- figure-restorer:start figure-1 -->") == 1
+    assert second.count("<!-- figure-restorer:end figure-1 -->") == 1
+    assert "paper_assets/new-image.png" in second
+    assert "paper_assets/figure-001.png" not in second
+
+
+def test_blocked_cli_publishes_incomplete_report_and_exit_four(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches a CLI that claims complete coverage for blocked figures."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    manifest_path = _manifest_file(
+        tmp_path,
+        [{"id": "figure-1", "status": "blocked", "reason": "manual review"}],
+    )
+    output_path = tmp_path / "translated_with_figures.md"
+    script = Path(__file__).resolve().parents[1] / "paper-translation-figure-restorer" / "scripts" / "restore_figures.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            str(controlled_pdf),
+            str(markdown_path),
+            str(manifest_path),
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 4
+    report = output_path.with_name("translated_with_figures_figure_report.md")
+    assert output_path.is_file()
+    assert report.is_file()
+    assert "INCOMPLETE" in report.read_text(encoding="utf-8")
+    assert "Traceback" not in result.stderr
+
+
+def test_publish_failure_leaves_previous_bundle_unchanged(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches partial publication that destroys the previous output bundle."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "translated_with_figures.md"
+    output_path.write_text("OLD OUTPUT", encoding="utf-8")
+    assets_path = tmp_path / "translated_with_figures_assets"
+    assets_path.mkdir()
+    (assets_path / "old.png").write_bytes(b"OLD ASSET")
+    report_path = tmp_path / "translated_with_figures_figure_report.md"
+    report_path.write_text("OLD REPORT", encoding="utf-8")
+    manifest_path = _manifest_file(
+        tmp_path,
+        [{
+            "id": "figure-1",
+            "status": "blocked",
+            "reason": "manual review",
+        }],
+    )
+
+    def fail_render(*args: object, **kwargs: object) -> list[restorer.RenderedFigure]:
+        raise restorer.RestorationError("render", "render failed")
+
+    monkeypatch.setattr(restorer, "render_figure_crops", fail_render)
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+        )
+    assert caught.value.category == "render"
+    assert output_path.read_text(encoding="utf-8") == "OLD OUTPUT"
+    assert (assets_path / "old.png").read_bytes() == b"OLD ASSET"
+    assert report_path.read_text(encoding="utf-8") == "OLD REPORT"
+    assert markdown_path.read_text(encoding="utf-8") == translated_markdown
+
+
+def test_restore_derives_sibling_bundle_paths_and_preserves_source_bytes(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches default-path drift and prose/table rewrites outside markers."""
+
+    markdown_path = tmp_path / "translated.md"
+    source_bytes = translated_markdown.encode("utf-8")
+    markdown_path.write_bytes(source_bytes)
+    manifest_path = _manifest_file(tmp_path, [_restore()])
+
+    result = restorer.restore_figures(controlled_pdf, markdown_path, manifest_path, dpi=144)
+
+    assert result.output_path == tmp_path / "translated_with_figures.md"
+    assert result.assets_dir == tmp_path / "translated_with_figures_assets"
+    assert result.report_path == tmp_path / "translated_with_figures_figure_report.md"
+    assert markdown_path.read_bytes() == source_bytes
+    generated = result.output_path.read_text(encoding="utf-8")
+    without_block = re.sub(
+        r"<!-- figure-restorer:start figure-1 -->\n.*?<!-- figure-restorer:end figure-1 -->\n",
+        "",
+        generated,
+        flags=re.DOTALL,
+    )
+    assert without_block == translated_markdown
+    assert "| 输入 | 输出 |\n| --- | --- |\n| A | B |" in generated
+
+
+def test_after_position_and_percent_encoded_links_are_portable(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches URI-unsafe filenames and placement before the wrong caption."""
+
+    markdown_path = tmp_path / "translated source.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "published copy.md"
+    manifest_path = _manifest_file(
+        tmp_path,
+        [_restore(position="after", filename="figure one+?.png")],
+    )
+
+    result = restorer.restore_figures(
+        controlled_pdf,
+        markdown_path,
+        manifest_path,
+        output_path=output_path,
+        dpi=144,
+    )
+    generated = output_path.read_text(encoding="utf-8")
+    caption_end = generated.index("**图 1：系统概览。**") + len("**图 1：系统概览。**")
+    marker_start = generated.index("<!-- figure-restorer:start figure-1 -->")
+    assert caption_end < marker_start
+    assert "published%20copy_assets/figure%20one%2B%3F.png" in generated
+    assert (result.assets_dir / "figure one+?.png").is_file()
+
+
+def test_restore_rerun_replaces_existing_marker_without_duplication(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches a pipeline that inserts a second block when rerun on its output."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    manifest_path = _manifest_file(tmp_path, [_restore()])
+    first = restorer.restore_figures(
+        controlled_pdf, markdown_path, manifest_path, dpi=144
+    )
+    second = restorer.restore_figures(
+        controlled_pdf,
+        first.output_path,
+        manifest_path,
+        output_path=first.output_path,
+        in_place=True,
+        dpi=220,
+    )
+    text = second.output_path.read_text(encoding="utf-8")
+    assert text.count("<!-- figure-restorer:start figure-1 -->") == 1
+    assert text.count("<!-- figure-restorer:end figure-1 -->") == 1
+
+
+def test_multiple_insertions_resolve_offsets_from_original_markdown(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches forward edits that shift a later caption's insertion offset."""
+
+    figures = [
+        _restore(),
+        _restore(
+            figure_id="figure-2",
+            page=2,
+            bbox=[35.0, 55.0, 325.0, 145.0],
+            anchor="**图 2：双面板结果。**",
+            filename="figure-002.png",
+            alt="图 2：双面板结果",
+        ),
+    ]
+    manifest_path = _manifest_file(tmp_path, figures)
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "translated_with_figures.md"
+    result = restorer.restore_figures(
+        controlled_pdf,
+        markdown_path,
+        manifest_path,
+        output_path=output_path,
+        dpi=144,
+    )
+    text = result.output_path.read_text(encoding="utf-8")
+    assert text.count("figure-restorer:start") == 2
+    assert text.index("figure-restorer:start figure-1") < text.index("**图 1：系统概览。**")
+    assert text.index("figure-restorer:start figure-2") < text.index("**图 2：双面板结果。**")
+
+
+def test_mismatched_and_nested_existing_markers_are_rejected(
+    tmp_path: Path,
+    pdf_document: fitz.Document,
+    translated_markdown: str,
+    assets_dir: Path,
+) -> None:
+    """Catches marker parsing that silently consumes another figure's block."""
+
+    specs = _valid_specs(tmp_path, pdf_document, translated_markdown, assets_dir)
+    rendered = render_figure_crops(pdf_document, specs, assets_dir, dpi=144)
+    malformed = (
+        "<!-- figure-restorer:start figure-1 -->\n"
+        "<!-- figure-restorer:end figure-2 -->\n"
+    )
+    nested = (
+        "<!-- figure-restorer:start figure-1 -->\n"
+        "<!-- figure-restorer:start figure-1 -->\n"
+        "<!-- figure-restorer:end figure-1 -->\n"
+        "<!-- figure-restorer:end figure-1 -->\n"
+    )
+    for prefix in (malformed, nested):
+        with pytest.raises(restorer.RestorationError) as caught:
+            restorer.apply_generated_blocks(prefix + translated_markdown, rendered)
+        assert caught.value.category == "anchor"
+
+
+def test_already_present_skip_and_blocked_are_reported_without_asset_replacement(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches copying an existing asset and dropping non-restored states."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "translated_with_figures.md"
+    assets_path = tmp_path / "translated_with_figures_assets"
+    assets_path.mkdir()
+    existing = assets_path / "existing.png"
+    existing.write_bytes(b"verified asset")
+    original_stat = existing.stat()
+    manifest_path = _manifest_file(
+        tmp_path,
+        [
+            {
+                "id": "figure-1",
+                "status": "already-present",
+                "existing_asset": "existing.png",
+            },
+            {"id": "figure-2", "status": "skip", "reason": "decorative"},
+            {"id": "figure-3", "status": "blocked", "reason": "ambiguous"},
+        ],
+    )
+
+    result = restorer.restore_figures(
+        controlled_pdf,
+        markdown_path,
+        manifest_path,
+        output_path=output_path,
+    )
+
+    assert result.exit_code == 4 and result.blocked
+    assert existing.read_bytes() == b"verified asset"
+    assert existing.stat().st_ino == original_stat.st_ino
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "INCOMPLETE" in report
+    assert "already-present" in report and "decorative" in report and "ambiguous" in report
+    assert "COMPLETE" not in report.replace("INCOMPLETE", "")
+
+
+def test_source_collision_requires_explicit_in_place_and_creates_backup(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches accidental source overwrite and missing recoverable backups."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    manifest_path = _manifest_file(
+        tmp_path,
+        [{"id": "figure-1", "status": "skip", "reason": "decorative"}],
+    )
+
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=markdown_path,
+        )
+    assert caught.value.category == "input"
+    original = markdown_path.read_bytes()
+
+    result = restorer.restore_figures(
+        controlled_pdf,
+        markdown_path,
+        manifest_path,
+        in_place=True,
+    )
+    assert result.output_path == markdown_path
+    assert markdown_path.with_name("translated.md.bak").read_bytes() == original
+
+
+def test_symlinked_output_is_rejected_before_publication(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches resolving a symlinked output into an external destination."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    output_path = tmp_path / "published.md"
+    output_path.symlink_to(outside)
+    manifest_path = _manifest_file(
+        tmp_path,
+        [{"id": "figure-1", "status": "skip", "reason": "decorative"}],
+    )
+
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+        )
+    assert caught.value.category == "local_io"
+    assert outside.read_text(encoding="utf-8") == "outside"
+
+
+def test_report_write_failure_leaves_existing_bundle_unchanged(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches report writes that publish a new Markdown before failing."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "published.md"
+    output_path.write_text("OLD OUTPUT", encoding="utf-8")
+    report_path = tmp_path / "published_figure_report.md"
+    report_path.write_text("OLD REPORT", encoding="utf-8")
+    assets_path = tmp_path / "published_assets"
+    assets_path.mkdir()
+    (assets_path / "old.png").write_bytes(b"OLD ASSET")
+    manifest_path = _manifest_file(tmp_path, [_restore()])
+    original_write_text = Path.write_text
+
+    def fail_report_write(
+        path: Path, data: str, *args: object, **kwargs: object
+    ) -> int:
+        if path.name == report_path.name:
+            raise OSError("simulated report failure")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_report_write)
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+            dpi=144,
+        )
+    assert caught.value.category == "local_io"
+    assert output_path.read_text(encoding="utf-8") == "OLD OUTPUT"
+    assert report_path.read_text(encoding="utf-8") == "OLD REPORT"
+    assert (assets_path / "old.png").read_bytes() == b"OLD ASSET"
+
+
+def test_rename_failure_rolls_back_all_published_targets(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a failed second rename that leaves a partially published bundle."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "published.md"
+    output_path.write_text("OLD OUTPUT", encoding="utf-8")
+    report_path = tmp_path / "published_figure_report.md"
+    report_path.write_text("OLD REPORT", encoding="utf-8")
+    assets_path = tmp_path / "published_assets"
+    assets_path.mkdir()
+    (assets_path / "old.png").write_bytes(b"OLD ASSET")
+    manifest_path = _manifest_file(tmp_path, [_restore()])
+    original_replace = restorer.os.replace
+    calls = 0
+
+    def fail_report_rename(source: str | Path, target: str | Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("simulated rename failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(restorer.os, "replace", fail_report_rename)
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+            dpi=144,
+        )
+    assert caught.value.category == "local_io"
+    assert output_path.read_text(encoding="utf-8") == "OLD OUTPUT"
+    assert report_path.read_text(encoding="utf-8") == "OLD REPORT"
+    assert (assets_path / "old.png").read_bytes() == b"OLD ASSET"

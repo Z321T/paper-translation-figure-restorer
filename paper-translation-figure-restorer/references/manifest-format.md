@@ -70,3 +70,39 @@ The source Markdown is preserved outside helper-generated marked image blocks;
 never replace a structured Markdown table with a screenshot. Crop decisions
 are model-owned and paper-specific, not inferred solely from embedded-image
 enumeration or a successful helper run.
+
+## Published bundle and reruns
+
+By default, a source named `paper.md` produces these siblings:
+
+```text
+paper_with_figures.md
+paper_with_figures_assets/
+paper_with_figures_figure_report.md
+```
+
+When `--output custom-name.md` is supplied, the sibling directory and report
+are `custom-name_assets/` and `custom-name_figure_report.md`. The source is
+never overwritten unless `--in-place` is explicit. In-place mode writes a
+recoverable `paper.md.bak` before replacing the source transactionally.
+
+Restored images are delimited by these exact markers:
+
+```markdown
+<!-- figure-restorer:start figure-1 -->
+![图 1：系统概览](paper_with_figures_assets/figure-001.png)
+<!-- figure-restorer:end figure-1 -->
+```
+
+Anchors are resolved against the unmodified source and insertions are applied
+from the highest byte offset to the lowest. A rerun replaces the matching
+marker block rather than adding a duplicate. Mismatched or nested marker IDs,
+unsafe output paths, and failed publication are errors; staging and rollback
+leave the existing source and previously published bundle unchanged.
+
+The CLI returns exit `0` for complete success, `2` for invalid inputs,
+manifest values, or anchors, `3` for rendering or local-I/O failures, and `4`
+when a bundle is published while one or more figures are `blocked`. A report
+with any blocked item is explicitly marked `INCOMPLETE` and never claims full
+coverage. Reports contain basenames and relative asset names only; they do not
+expose absolute machine paths or source document contents.

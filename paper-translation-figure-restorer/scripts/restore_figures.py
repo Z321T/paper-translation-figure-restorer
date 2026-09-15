@@ -9,9 +9,16 @@ from __future__ import annotations
 import json
 import math
 import numbers
+import argparse
+import os
+import re
+import shutil
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Final, Sequence
+from urllib.parse import quote
 
 import pymupdf
 
@@ -104,6 +111,28 @@ class RenderedFigure:
 
     def __repr__(self) -> str:
         return f"RenderedFigure(id={self.spec.id!r}, path={self.path.name!r})"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RestorationResult:
+    """Published bundle paths and coverage outcome."""
+
+    output_path: Path
+    assets_dir: Path
+    report_path: Path
+    figures: tuple[FigureSpec, ...]
+    blocked: bool
+    exit_code: int
+
+    @property
+    def complete(self) -> bool:
+        return not self.blocked
+
+    def __repr__(self) -> str:
+        return (
+            f"RestorationResult(output={self.output_path.name!r}, "
+            f"report={self.report_path.name!r}, blocked={self.blocked!r})"
+        )
 
 
 def _error(category: str, message: str) -> RestorationError:
@@ -296,6 +325,22 @@ def _reject_symlink_components(path: Path) -> None:
             current /= part
             if current.is_symlink():
                 raise _error("local_io", "asset path contains a symlink")
+    except RestorationError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _error("local_io", "asset path could not be inspected") from exc
+
+
+def _reject_tree_symlinks(root: Path) -> None:
+    """Reject symlink entries anywhere in an existing published asset tree."""
+
+    try:
+        if not root.exists():
+            return
+        for current, directories, files in os.walk(root, followlinks=False):
+            for name in (*directories, *files):
+                if Path(current, name).is_symlink():
+                    raise _error("local_io", "asset path contains a symlink")
     except RestorationError:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -554,12 +599,576 @@ def render_figure_crops(
     return rendered
 
 
+_MARKER_RE: Final = re.compile(
+    r"<!--\s*figure-restorer:(start|end)\s+([^\s]+)\s*-->"
+)
+
+
+def _marker_ranges(markdown: str, allowed_ids: set[str]) -> dict[str, tuple[int, int]]:
+    """Parse generated blocks and reject malformed, mismatched, or nested IDs."""
+
+    stack: tuple[str, int] | None = None
+    ranges: dict[str, tuple[int, int]] = {}
+    for match in _MARKER_RE.finditer(markdown):
+        kind, figure_id = match.groups()
+        if kind == "start":
+            if stack is not None:
+                raise _error("anchor", "generated figure markers are nested")
+            if figure_id not in allowed_ids:
+                raise _error("anchor", "generated figure marker ID is not expected")
+            if figure_id in ranges:
+                raise _error("anchor", "generated figure marker ID is duplicated")
+            stack = (figure_id, match.start())
+            continue
+
+        if stack is None or stack[0] != figure_id:
+            raise _error("anchor", "generated figure markers have mismatched IDs")
+        ranges[figure_id] = (stack[1], match.end())
+        stack = None
+
+    if stack is not None:
+        raise _error("anchor", "generated figure marker is missing its end")
+    return ranges
+
+
+def _encoded_asset_link(figure: RenderedFigure) -> str:
+    """Return a relative POSIX link for a staged crop."""
+
+    if not isinstance(figure.path, Path):
+        raise _error("local_io", "rendered crop path is invalid")
+    asset_directory = figure.path.parent.name
+    filename = figure.filename
+    if not asset_directory or asset_directory in {".", ".."} or not filename:
+        raise _error("local_io", "rendered crop path is invalid")
+    # quote each component separately so the slash remains a portable separator.
+    return "/".join(
+        quote(component, safe="-._~")
+        for component in (asset_directory, filename)
+    )
+
+
+def _markdown_alt(value: str) -> str:
+    """Keep a manifest alt label inside one safe Markdown image label."""
+
+    return (
+        value.replace("\\", "\\\\")
+        .replace("]", "\\]")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
+def _generated_block(figure: RenderedFigure) -> str:
+    if not isinstance(figure, RenderedFigure):
+        raise _error("manifest", "generated figures must be typed RenderedFigure objects")
+    spec = figure.spec
+    if (
+        spec.status != "restore"
+        or not isinstance(spec.id, str)
+        or not spec.id
+        or not isinstance(spec.alt, str)
+    ):
+        raise _error("manifest", "generated figure is not a restore item")
+    if (
+        any(character.isspace() for character in spec.id)
+        or "<!--" in spec.id
+        or "-->" in spec.id
+    ):
+        raise _error("manifest", "figure IDs must not contain whitespace")
+    link = _encoded_asset_link(figure)
+    return (
+        f"<!-- figure-restorer:start {spec.id} -->\n"
+        f"![{_markdown_alt(spec.alt)}]({link})\n"
+        f"<!-- figure-restorer:end {spec.id} -->"
+    )
+
+
+def _nth_occurrence(text: str, needle: str, occurrence: int) -> int:
+    position = -1
+    start = 0
+    for _ in range(occurrence):
+        position = text.find(needle, start)
+        if position < 0:
+            raise _error("anchor", "figure anchor occurrence is out of range")
+        start = position + len(needle)
+    return position
+
+
+def apply_generated_blocks(
+    markdown: str,
+    figures: Sequence[RenderedFigure],
+) -> str:
+    """Insert or replace marked image blocks without rewriting source prose."""
+
+    if not isinstance(markdown, str):
+        raise _error("input", "translated Markdown must be text")
+    try:
+        items = tuple(figures)
+    except TypeError as exc:
+        raise _error("manifest", "generated figures must be a sequence") from exc
+
+    by_id: dict[str, RenderedFigure] = {}
+    for figure in items:
+        if not isinstance(figure, RenderedFigure):
+            raise _error("manifest", "generated figures must be typed RenderedFigure objects")
+        if figure.id in by_id:
+            raise _error("manifest", "figure IDs must be unique")
+        by_id[figure.id] = figure
+
+    marker_ranges = _marker_ranges(markdown, set(by_id))
+    operations: list[tuple[int, int, str]] = []
+    for figure_id, figure in by_id.items():
+        spec = figure.spec
+        block = _generated_block(figure)
+        if figure_id in marker_ranges:
+            start, end = marker_ranges[figure_id]
+            operations.append((start, end, block))
+            continue
+
+        if not isinstance(spec.anchor, str) or not spec.anchor:
+            raise _error("anchor", "figure anchor was not found")
+        occurrence = spec.occurrence
+        count = markdown.count(spec.anchor)
+        if count == 0:
+            raise _error("anchor", "figure anchor was not found")
+        if occurrence is None:
+            if count != 1:
+                raise _error("anchor", "figure anchor is ambiguous")
+            occurrence = 1
+        if (
+            isinstance(occurrence, bool)
+            or not isinstance(occurrence, int)
+            or occurrence < 1
+            or occurrence > count
+        ):
+            raise _error("anchor", "figure anchor occurrence is out of range")
+        anchor_start = _nth_occurrence(markdown, spec.anchor, occurrence)
+        if spec.position == "before":
+            operations.append((anchor_start, anchor_start, block + "\n"))
+        elif spec.position == "after":
+            anchor_end = anchor_start + len(spec.anchor)
+            operations.append((anchor_end, anchor_end, "\n" + block))
+        else:
+            raise _error("manifest", "figure position is not supported")
+
+    # All offsets were calculated against the same unmodified source. Applying
+    # in descending order keeps every lower byte offset stable.
+    operations.sort(key=lambda operation: (operation[0], operation[1]), reverse=True)
+    previous_start = len(markdown) + 1
+    result = markdown
+    for start, end, replacement in operations:
+        if end > previous_start:
+            raise _error("anchor", "generated figure blocks overlap")
+        result = result[:start] + replacement + result[end:]
+        previous_start = start
+    return result
+
+
+def _coerce_path(value: object, field_name: str) -> Path:
+    if not isinstance(value, (str, Path, os.PathLike)):
+        raise _error("input", f"{field_name} path is invalid")
+    try:
+        path = Path(value)
+        if not str(path):
+            raise _error("input", f"{field_name} path is invalid")
+        return path
+    except (OSError, TypeError, ValueError) as exc:
+        raise _error("input", f"{field_name} path is invalid") from exc
+
+
+def _resolved_path(path: Path, field_name: str) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _error("local_io", f"{field_name} path could not be resolved") from exc
+
+
+def _bundle_paths(
+    markdown_path: Path,
+    output_path: object,
+    *,
+    in_place: bool,
+) -> tuple[Path, Path, Path]:
+    """Resolve output, sibling assets, and sibling report safely."""
+
+    source = _resolved_path(markdown_path, "Markdown")
+    try:
+        source_is_file = source.is_file()
+    except OSError as exc:
+        raise _error("input", "translated Markdown could not be read") from exc
+    if not source_is_file:
+        raise _error("input", "translated Markdown could not be read")
+    if in_place and output_path is None:
+        output = source
+    elif output_path is None:
+        output = source.with_name(f"{source.stem}_with_figures{source.suffix or '.md'}")
+    else:
+        raw_output = _coerce_path(output_path, "output")
+        try:
+            if ".." in raw_output.parts:
+                raise _error("input", "output path traversal is not allowed")
+            raw_output = raw_output.absolute()
+            _reject_symlink_components(raw_output)
+        except RestorationError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _error("local_io", "output path could not be inspected") from exc
+        output = _resolved_path(raw_output, "output")
+    if output_path is None and not in_place:
+        output = _resolved_path(output, "output")
+
+    if in_place:
+        if output != source:
+            raise _error("input", "in-place mode requires the Markdown source as output")
+    elif output == source:
+        raise _error("input", "output would overwrite the Markdown source")
+
+    try:
+        _reject_symlink_components(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_components(output)
+    except RestorationError:
+        raise
+    except OSError as exc:
+        raise _error("local_io", "output directory could not be prepared") from exc
+
+    assets = output.with_name(f"{output.stem}_assets")
+    report = output.with_name(f"{output.stem}_figure_report.md")
+    for candidate in (assets, report):
+        try:
+            _reject_symlink_components(candidate)
+        except RestorationError:
+            raise
+    _reject_tree_symlinks(assets)
+    if assets == source or report == source or assets == output or report == output:
+        raise _error("input", "output bundle paths collide")
+    if assets == report:
+        raise _error("input", "output bundle paths collide")
+    try:
+        if output.exists() and not output.is_file():
+            raise _error("local_io", "output path is not a file")
+        if report.exists() and not report.is_file():
+            raise _error("local_io", "report path is not a file")
+        if assets.exists() and not assets.is_dir():
+            raise _error("local_io", "asset path is not a directory")
+    except OSError as exc:
+        raise _error("local_io", "output bundle path could not be checked") from exc
+    return output, assets, report
+
+
+def _read_markdown(path: Path) -> tuple[bytes, str]:
+    try:
+        raw = path.read_bytes()
+        return raw, raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _error("input", "translated Markdown is not UTF-8") from exc
+    except OSError as exc:
+        raise _error("input", "translated Markdown could not be read") from exc
+
+
+def _report_safe_text(value: object) -> str:
+    """Render untrusted report cells without absolute paths or line breaks."""
+
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|/)[^\s|]+", "[path]", text)
+    return text.replace("|", "\\|").strip()
+
+
+def _coverage_report(
+    source: Path,
+    output: Path,
+    specs: Sequence[FigureSpec],
+) -> str:
+    counts = {status: 0 for status in sorted(_STATUSES)}
+    for spec in specs:
+        counts[spec.status] = counts.get(spec.status, 0) + 1
+    incomplete = counts.get("blocked", 0) > 0
+    lines = [
+        "# Figure restoration report",
+        "",
+        f"Status: {'INCOMPLETE' if incomplete else 'COMPLETE'}",
+        f"Source basename: {_report_safe_text(source.name)}",
+        f"Output basename: {_report_safe_text(output.name)}",
+        f"Total manifest figures: {len(specs)}",
+        "",
+        "## Counts by state",
+        "",
+    ]
+    for status in ("restore", "already-present", "skip", "blocked"):
+        lines.append(f"- {status}: {counts.get(status, 0)}")
+    lines.extend(
+        [
+            "",
+            "## Figure coverage",
+            "",
+            "| ID | Status | Page | Asset | Reason |",
+            "| --- | --- | ---: | --- | --- |",
+        ]
+    )
+    for spec in specs:
+        page = str(spec.page) if spec.page is not None else "—"
+        if spec.status == "restore":
+            asset = spec.filename or "—"
+            reason = "—"
+        elif spec.status == "already-present":
+            asset = spec.existing_asset or "—"
+            reason = "verified existing asset"
+        else:
+            asset = "—"
+            reason = spec.reason or "—"
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    _report_safe_text(spec.id),
+                    _report_safe_text(spec.status),
+                    _report_safe_text(page),
+                    _report_safe_text(asset),
+                    _report_safe_text(reason),
+                )
+            )
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _remove_published_path(path: Path) -> None:
+    try:
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+    except OSError:
+        # Rollback is best effort; the original exception remains the useful
+        # categorized failure for the caller.
+        pass
+
+
+def _publish_bundle(
+    *,
+    stage_root: Path,
+    staged_output: Path,
+    staged_report: Path,
+    staged_assets: Path,
+    output: Path,
+    report: Path,
+    assets: Path,
+    in_place: bool,
+) -> None:
+    """Publish staged siblings with a journal that can restore old targets."""
+
+    backup_root = stage_root / ".backups"
+    try:
+        backup_root.mkdir()
+    except OSError as exc:
+        raise _error("local_io", "publication staging could not be prepared") from exc
+    journal: list[tuple[Path, Path | None, bool]] = []
+    assets_created = False
+    try:
+        for staged, target in ((staged_output, output), (staged_report, report)):
+            old_exists = target.exists() or target.is_symlink()
+            backup: Path | None = None
+            if old_exists:
+                backup = backup_root / f"backup-{len(journal)}"
+                os.replace(target, backup)
+            journal.append((target, backup, old_exists))
+            os.replace(staged, target)
+
+        if not assets.exists():
+            assets.mkdir()
+            assets_created = True
+        elif not assets.is_dir():
+            raise _error("local_io", "asset path is not a directory")
+
+        staged_files = sorted(
+            (path for path in staged_assets.iterdir() if path.is_file()),
+            key=lambda path: path.name,
+        )
+        for staged_file in staged_files:
+            target = assets / staged_file.name
+            _reject_symlink_components(target)
+            old_exists = target.exists() or target.is_symlink()
+            backup = None
+            if old_exists:
+                backup = backup_root / f"backup-{len(journal)}"
+                os.replace(target, backup)
+            journal.append((target, backup, old_exists))
+            os.replace(staged_file, target)
+    except RestorationError:
+        _rollback_bundle(journal, assets, assets_created)
+        raise
+    except OSError as exc:
+        _rollback_bundle(journal, assets, assets_created)
+        raise _error("local_io", "published bundle could not be written") from exc
+
+
+def _rollback_bundle(
+    journal: Sequence[tuple[Path, Path | None, bool]],
+    assets: Path,
+    assets_created: bool,
+) -> None:
+    for target, backup, old_exists in reversed(journal):
+        if target.exists() or target.is_symlink():
+            _remove_published_path(target)
+        if old_exists and backup is not None and backup.exists():
+            try:
+                os.replace(backup, target)
+            except OSError:
+                pass
+    if assets_created:
+        _remove_published_path(assets)
+
+
+def _create_in_place_backup(source: Path) -> Path:
+    backup = source.with_name(source.name + ".bak")
+    try:
+        _reject_symlink_components(backup)
+        shutil.copy2(source, backup)
+    except RestorationError:
+        raise
+    except OSError as exc:
+        raise _error("local_io", "in-place Markdown backup could not be created") from exc
+    return backup
+
+
+def restore_figures(
+    pdf_path: object,
+    markdown_path: object,
+    manifest_path: object,
+    *,
+    output_path: object = None,
+    dpi: int = 220,
+    in_place: bool = False,
+) -> RestorationResult:
+    """Validate, render, and publish a portable restored-figure bundle."""
+
+    pdf = _resolved_path(_coerce_path(pdf_path, "PDF"), "PDF")
+    markdown_file = _resolved_path(
+        _coerce_path(markdown_path, "Markdown"), "Markdown"
+    )
+    manifest_file = _resolved_path(
+        _coerce_path(manifest_path, "manifest"), "manifest"
+    )
+    if not pdf.is_file():
+        raise _error("input", "PDF could not be read")
+    output, assets, report = _bundle_paths(
+        markdown_file, output_path, in_place=bool(in_place)
+    )
+    _, markdown = _read_markdown(markdown_file)
+    manifest = load_manifest(manifest_file)
+
+    try:
+        document = pymupdf.open(pdf)
+    except Exception as exc:
+        raise _error("input", "PDF could not be opened") from exc
+
+    stage_root: Path | None = None
+    try:
+        specs = validate_manifest(manifest, document, markdown, assets)
+        if any(
+            spec.status == "restore" and spec.filename == markdown_file.name
+            for spec in specs
+        ):
+            raise _error("manifest", "generated asset filename collides with Markdown")
+        try:
+            stage_root = Path(
+                tempfile.mkdtemp(prefix=".figure-restorer-", dir=str(output.parent))
+            )
+            staged_assets = stage_root / assets.name
+            staged_assets.mkdir()
+            rendered = render_figure_crops(document, specs, staged_assets, dpi)
+            generated_markdown = apply_generated_blocks(markdown, rendered)
+            staged_output = stage_root / output.name
+            staged_report = stage_root / report.name
+            staged_output.write_bytes(generated_markdown.encode("utf-8"))
+            staged_report.write_text(
+                _coverage_report(markdown_file, output, specs),
+                encoding="utf-8",
+            )
+        except RestorationError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise _error("local_io", "staged bundle could not be written") from exc
+        except Exception as exc:
+            raise _error("local_io", "staged bundle could not be written") from exc
+
+        if in_place:
+            _create_in_place_backup(markdown_file)
+        _publish_bundle(
+            stage_root=stage_root,
+            staged_output=staged_output,
+            staged_report=staged_report,
+            staged_assets=staged_assets,
+            output=output,
+            report=report,
+            assets=assets,
+            in_place=bool(in_place),
+        )
+        blocked = any(spec.status == "blocked" for spec in specs)
+        return RestorationResult(
+            output_path=output,
+            assets_dir=assets,
+            report_path=report,
+            figures=tuple(specs),
+            blocked=blocked,
+            exit_code=4 if blocked else 0,
+        )
+    finally:
+        document.close()
+        if stage_root is not None:
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="restore_figures.py",
+        description="Render approved PDF crops into a translated Markdown bundle.",
+    )
+    parser.add_argument("PDF", help="authoritative PDF")
+    parser.add_argument("MARKDOWN", help="existing translated Markdown")
+    parser.add_argument("MANIFEST", help="version-1 figure manifest JSON")
+    parser.add_argument("--output", metavar="PATH", help="output Markdown path")
+    parser.add_argument("--dpi", metavar="N", type=int, default=220)
+    parser.add_argument("--in-place", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        args = _cli_parser().parse_args(argv)
+        result = restore_figures(
+            args.PDF,
+            args.MARKDOWN,
+            args.MANIFEST,
+            output_path=args.output,
+            dpi=args.dpi,
+            in_place=args.in_place,
+        )
+        return result.exit_code
+    except RestorationError as exc:
+        exit_code = 2 if exc.category in {"input", "manifest", "anchor"} else 3
+        print(f"error: {exc.category}: {exc.message}", file=sys.stderr)
+        return exit_code
+    except Exception:
+        print("error: local_io: operation failed", file=sys.stderr)
+        return 3
+
+
 __all__ = [
     "FigureSpec",
     "Manifest",
     "RenderedFigure",
+    "RestorationResult",
     "RestorationError",
+    "apply_generated_blocks",
     "load_manifest",
+    "main",
     "render_figure_crops",
+    "restore_figures",
     "validate_manifest",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
