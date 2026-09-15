@@ -954,7 +954,15 @@ def _validate_in_place_backup(
     except OSError as exc:
         raise _error("local_io", "in-place Markdown backup could not be checked") from exc
 
+    backup_identity = _file_identity(backup, "in-place Markdown backup")
     resolved_inputs = tuple(_resolved_path(path, "input") for path in input_paths)
+    protected_targets = (*resolved_inputs, output, assets, report)
+    if backup_identity is not None:
+        for candidate in protected_targets:
+            candidate_identity = _file_identity(candidate, "protected publication path")
+            if candidate_identity == backup_identity:
+                raise _error("input", "in-place backup aliases a protected path")
+
     for target in (backup, output, assets, report):
         for input_path in resolved_inputs:
             # The explicit in-place exception is only for the Markdown output;
@@ -971,6 +979,18 @@ def _validate_in_place_backup(
         if target == backup or target.is_relative_to(backup) or backup.is_relative_to(target):
             raise _error("input", "in-place backup collides with the output bundle")
     return backup
+
+
+def _file_identity(path: Path, field_name: str) -> tuple[int, int] | None:
+    """Return the follow-symlink device/inode identity for an existing path."""
+
+    try:
+        stat_result = os.stat(path, follow_symlinks=True)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _error("local_io", f"{field_name} could not be inspected") from exc
+    return stat_result.st_dev, stat_result.st_ino
 
 
 def _report_safe_text(value: object) -> str:

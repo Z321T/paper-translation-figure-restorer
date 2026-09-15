@@ -1471,3 +1471,44 @@ def test_existing_in_place_backup_symlink_is_rejected_safely(
     assert caught.value.category == "local_io"
     assert markdown_path.read_bytes() == source_bytes
     assert outside.read_text(encoding="utf-8") == "outside"
+
+
+@pytest.mark.parametrize("hardlink_input", ["manifest", "pdf"])
+def test_in_place_backup_rejects_hardlink_alias_to_input(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    hardlink_input: str,
+) -> None:
+    """Catches backup copy-through-hardlink corruption of a PDF or manifest."""
+
+    markdown_path = tmp_path / "paper.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    backup_path = markdown_path.with_name("paper.md.bak")
+    manifest_path = _manifest_file(
+        tmp_path,
+        [{"id": "figure-1", "status": "skip", "reason": "decorative"}],
+    )
+    if hardlink_input == "manifest":
+        backup_path.hardlink_to(manifest_path)
+        pdf_path = controlled_pdf
+    else:
+        backup_path.hardlink_to(controlled_pdf)
+        pdf_path = controlled_pdf
+    snapshots = {
+        markdown_path: markdown_path.read_bytes(),
+        backup_path: backup_path.read_bytes(),
+        manifest_path: manifest_path.read_bytes(),
+        pdf_path: pdf_path.read_bytes(),
+    }
+
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            pdf_path,
+            markdown_path,
+            manifest_path,
+            in_place=True,
+        )
+    assert caught.value.category == "input"
+    for path, contents in snapshots.items():
+        assert path.read_bytes() == contents
