@@ -1,7 +1,8 @@
-"""Validate figure manifests and render deterministic PDF crops.
+"""Validate, render, insert, and publish portable restored-figure bundles.
 
-This module deliberately stops at typed validation and crop rendering.  The
-calling workflow owns Markdown insertion, publication, and reporting.
+Crop coordinates remain model-selected and paper-specific; this helper only
+performs deterministic validation, rendering, marked insertion, reporting, and
+transactional publication.
 """
 
 from __future__ import annotations
@@ -454,6 +455,11 @@ def validate_manifest(
     seen_ids: set[str] = set()
     seen_filenames: set[str] = set()
     validated: list[FigureSpec] = []
+    marker_ids = {
+        spec.id for spec in manifest.figures if isinstance(spec, FigureSpec)
+    }
+    marker_ranges = _marker_ranges(markdown, marker_ids)
+    anchor_markdown = _remove_marker_ranges(markdown, marker_ranges, marker_ids)
     for spec in manifest.figures:
         if not isinstance(spec, FigureSpec):
             raise _error("manifest", "manifest figures must be typed FigureSpec objects")
@@ -488,7 +494,7 @@ def validate_manifest(
             seen_filenames.add(spec.filename)
             _safe_relative_path(spec.filename, root, require_basename=True)
             _validate_restore_geometry(spec, document)
-            spec = _validate_anchor(spec, markdown)
+            spec = _validate_anchor(spec, anchor_markdown)
         elif spec.status == "already-present":
             if not isinstance(spec.existing_asset, str) or not spec.existing_asset.strip():
                 raise _error("manifest", "existing asset is required")
@@ -631,6 +637,54 @@ def _marker_ranges(markdown: str, allowed_ids: set[str]) -> dict[str, tuple[int,
     return ranges
 
 
+def _remove_marker_ranges(
+    markdown: str,
+    ranges: dict[str, tuple[int, int]],
+    ids: set[str],
+) -> str:
+    """Remove selected generated blocks while preserving all other text."""
+
+    result = markdown
+    for _figure_id, (start, end) in sorted(
+        ((figure_id, bounds) for figure_id, bounds in ranges.items() if figure_id in ids),
+        key=lambda item: item[1][0],
+        reverse=True,
+    ):
+        result = result[:start] + result[end:]
+    return result
+
+
+def _anchor_occurrences_outside_markers(
+    markdown: str,
+    anchor: str,
+    ranges: dict[str, tuple[int, int]],
+) -> list[int]:
+    """Find anchor offsets in source text, excluding generated marker blocks."""
+
+    if not ranges:
+        return [
+            position
+            for position in (
+                match.start() for match in re.finditer(re.escape(anchor), markdown)
+            )
+        ]
+    positions: list[int] = []
+    cursor = 0
+    for start, end in sorted(ranges.values()):
+        if cursor < start:
+            positions.extend(
+                cursor + match.start()
+                for match in re.finditer(re.escape(anchor), markdown[cursor:start])
+            )
+        cursor = max(cursor, end)
+    if cursor < len(markdown):
+        positions.extend(
+            cursor + match.start()
+            for match in re.finditer(re.escape(anchor), markdown[cursor:])
+        )
+    return positions
+
+
 def _encoded_asset_link(figure: RenderedFigure) -> str:
     """Return a relative POSIX link for a staged crop."""
 
@@ -728,7 +782,10 @@ def apply_generated_blocks(
         if not isinstance(spec.anchor, str) or not spec.anchor:
             raise _error("anchor", "figure anchor was not found")
         occurrence = spec.occurrence
-        count = markdown.count(spec.anchor)
+        anchor_positions = _anchor_occurrences_outside_markers(
+            markdown, spec.anchor, marker_ranges
+        )
+        count = len(anchor_positions)
         if count == 0:
             raise _error("anchor", "figure anchor was not found")
         if occurrence is None:
@@ -742,7 +799,7 @@ def apply_generated_blocks(
             or occurrence > count
         ):
             raise _error("anchor", "figure anchor occurrence is out of range")
-        anchor_start = _nth_occurrence(markdown, spec.anchor, occurrence)
+        anchor_start = anchor_positions[occurrence - 1]
         if spec.position == "before":
             operations.append((anchor_start, anchor_start, block + "\n"))
         elif spec.position == "after":
@@ -788,6 +845,7 @@ def _bundle_paths(
     output_path: object,
     *,
     in_place: bool,
+    input_paths: Sequence[Path] = (),
 ) -> tuple[Path, Path, Path]:
     """Resolve output, sibling assets, and sibling report safely."""
 
@@ -844,6 +902,17 @@ def _bundle_paths(
         raise _error("input", "output bundle paths collide")
     if assets == report:
         raise _error("input", "output bundle paths collide")
+    resolved_inputs = tuple(_resolved_path(path, "input") for path in input_paths)
+    for target in (output, assets, report):
+        for input_path in resolved_inputs:
+            if in_place and target == output == source == input_path:
+                continue
+            if (
+                target == input_path
+                or target.is_relative_to(input_path)
+                or input_path.is_relative_to(target)
+            ):
+                raise _error("input", "output bundle collides with an input")
     try:
         if output.exists() and not output.is_file():
             raise _error("local_io", "output path is not a file")
@@ -954,7 +1023,6 @@ def _publish_bundle(
     output: Path,
     report: Path,
     assets: Path,
-    in_place: bool,
 ) -> None:
     """Publish staged siblings with a journal that can restore old targets."""
 
@@ -1053,7 +1121,10 @@ def restore_figures(
     if not pdf.is_file():
         raise _error("input", "PDF could not be read")
     output, assets, report = _bundle_paths(
-        markdown_file, output_path, in_place=bool(in_place)
+        markdown_file,
+        output_path,
+        in_place=bool(in_place),
+        input_paths=(pdf, markdown_file, manifest_file),
     )
     _, markdown = _read_markdown(markdown_file)
     manifest = load_manifest(manifest_file)
@@ -1103,7 +1174,6 @@ def restore_figures(
             output=output,
             report=report,
             assets=assets,
-            in_place=bool(in_place),
         )
         blocked = any(spec.status == "blocked" for spec in specs)
         return RestorationResult(

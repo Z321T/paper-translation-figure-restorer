@@ -1161,3 +1161,239 @@ def test_rename_failure_rolls_back_all_published_targets(
     assert output_path.read_text(encoding="utf-8") == "OLD OUTPUT"
     assert report_path.read_text(encoding="utf-8") == "OLD REPORT"
     assert (assets_path / "old.png").read_bytes() == b"OLD ASSET"
+
+
+@pytest.mark.parametrize("collision", ["pdf", "manifest", "assets", "report"])
+def test_bundle_targets_reject_any_input_collision_or_containment(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    collision: str,
+) -> None:
+    """Catches publication targets that overwrite or contain an input file."""
+
+    markdown_path = tmp_path / "paper.md"
+    source_bytes = translated_markdown.encode("utf-8")
+    markdown_path.write_bytes(source_bytes)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {"version": 1, "figures": [{"id": "figure-1", "status": "skip", "reason": "decorative"}]}
+        ),
+        encoding="utf-8",
+    )
+    if collision == "pdf":
+        output_path = controlled_pdf
+    elif collision == "manifest":
+        output_path = manifest_path
+    elif collision == "assets":
+        output_path = tmp_path / "published.md"
+        # The derived `published_assets` directory is also an input container.
+        manifest_path = tmp_path / "published_assets"
+        manifest_path.write_text(
+            json.dumps(
+                {"version": 1, "figures": [{"id": "figure-1", "status": "skip", "reason": "decorative"}]}
+            ),
+            encoding="utf-8",
+        )
+    else:
+        output_path = tmp_path / "published.md"
+        manifest_path = tmp_path / "published_figure_report.md"
+        manifest_path.write_text(
+            json.dumps(
+                {"version": 1, "figures": [{"id": "figure-1", "status": "skip", "reason": "decorative"}]}
+            ),
+            encoding="utf-8",
+        )
+    input_snapshots = {
+        controlled_pdf: controlled_pdf.read_bytes(),
+        markdown_path: source_bytes,
+        manifest_path: manifest_path.read_bytes(),
+    }
+
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+        )
+    assert caught.value.category == "input"
+    for path, contents in input_snapshots.items():
+        assert path.read_bytes() == contents
+
+
+def test_anchor_text_inside_alt_does_not_make_a_valid_rerun_ambiguous(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches anchor validation that counts text inside its own generated block."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    anchor = "**图 1：系统概览。**"
+    manifest_path = _manifest_file(
+        tmp_path,
+        [_restore(alt=anchor)],
+    )
+    first = restorer.restore_figures(
+        controlled_pdf,
+        markdown_path,
+        manifest_path,
+        dpi=144,
+    )
+    second = restorer.restore_figures(
+        controlled_pdf,
+        first.output_path,
+        manifest_path,
+        output_path=first.output_path,
+        in_place=True,
+        dpi=144,
+    )
+    text = second.output_path.read_text(encoding="utf-8")
+    assert text.count("<!-- figure-restorer:start figure-1 -->") == 1
+    assert text.count(anchor) == 2
+
+
+def test_first_publication_rename_failure_leaves_no_partial_bundle(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a first-run failure that leaves newly created siblings behind."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "published.md"
+    manifest_path = _manifest_file(tmp_path, [_restore()])
+    original_replace = restorer.os.replace
+
+    def fail_first_rename(source: str | Path, target: str | Path) -> None:
+        raise OSError("simulated first rename failure")
+
+    monkeypatch.setattr(restorer.os, "replace", fail_first_rename)
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+            dpi=144,
+        )
+    assert caught.value.category == "local_io"
+    assert not output_path.exists()
+    assert not (tmp_path / "published_assets").exists()
+    assert not (tmp_path / "published_figure_report.md").exists()
+    # Keep the monkeypatch's referenced function live for implementations that
+    # choose to make a preflight rename.
+    assert original_replace is not None
+
+
+def test_partial_asset_rename_failure_restores_previous_assets(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches asset-level publication failure after Markdown was replaced."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    output_path = tmp_path / "published.md"
+    output_path.write_text("OLD OUTPUT", encoding="utf-8")
+    assets_path = tmp_path / "published_assets"
+    assets_path.mkdir()
+    (assets_path / "figure-001.png").write_bytes(b"OLD FIGURE")
+    (assets_path / "old.png").write_bytes(b"OLD ASSET")
+    report_path = tmp_path / "published_figure_report.md"
+    report_path.write_text("OLD REPORT", encoding="utf-8")
+    figures = [
+        _restore(filename="figure-001.png"),
+        _restore(
+            figure_id="figure-2",
+            page=2,
+            bbox=[35.0, 55.0, 325.0, 145.0],
+            anchor="**图 2：双面板结果。**",
+            filename="figure-002.png",
+            alt="图 2：双面板结果",
+        ),
+    ]
+    manifest_path = _manifest_file(tmp_path, figures)
+    original_replace = restorer.os.replace
+    calls = 0
+
+    def fail_second_asset_move(source: str | Path, target: str | Path) -> None:
+        nonlocal calls
+        calls += 1
+        # output backup/install, report backup/install, first asset backup;
+        # fail before the second asset can be installed.
+        if calls == 7:
+            raise OSError("simulated asset rename failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(restorer.os, "replace", fail_second_asset_move)
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            output_path=output_path,
+            dpi=144,
+        )
+    assert caught.value.category == "local_io"
+    assert output_path.read_text(encoding="utf-8") == "OLD OUTPUT"
+    assert report_path.read_text(encoding="utf-8") == "OLD REPORT"
+    assert (assets_path / "figure-001.png").read_bytes() == b"OLD FIGURE"
+    assert (assets_path / "old.png").read_bytes() == b"OLD ASSET"
+    assert not (assets_path / "figure-002.png").exists()
+
+
+def test_cli_maps_validation_and_local_io_errors_without_tracebacks(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches CLI tracebacks/content leaks and incorrect error exit classes."""
+
+    markdown_path = tmp_path / "translated.md"
+    markdown_path.write_text(translated_markdown + "SECRET_MARKDOWN", encoding="utf-8")
+    bad_manifest = _manifest_file(
+        tmp_path,
+        [_restore(anchor="**missing SECRET_MANIFEST**")],
+    )
+    script = Path(__file__).resolve().parents[1] / "paper-translation-figure-restorer" / "scripts" / "restore_figures.py"
+    validation = subprocess.run(
+        [sys.executable, str(script), str(controlled_pdf), str(markdown_path), str(bad_manifest)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert validation.returncode == 2
+    assert "Traceback" not in validation.stderr
+    assert "SECRET_MARKDOWN" not in validation.stderr
+    output_path = tmp_path / "published.md"
+    output_path.symlink_to(tmp_path / "outside.md")
+    (tmp_path / "outside.md").write_text("outside", encoding="utf-8")
+    valid_manifest = _manifest_file(
+        tmp_path,
+        [{"id": "figure-1", "status": "skip", "reason": "decorative"}],
+    )
+    local_io = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            str(controlled_pdf),
+            str(markdown_path),
+            str(valid_manifest),
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert local_io.returncode == 3
+    assert "Traceback" not in local_io.stderr
+    assert "SECRET_MARKDOWN" not in local_io.stderr
