@@ -905,7 +905,7 @@ def _bundle_paths(
     resolved_inputs = tuple(_resolved_path(path, "input") for path in input_paths)
     for target in (output, assets, report):
         for input_path in resolved_inputs:
-            if in_place and target == output == source == input_path:
+            if in_place and target == output == source == input_path == markdown_path:
                 continue
             if (
                 target == input_path
@@ -933,6 +933,44 @@ def _read_markdown(path: Path) -> tuple[bytes, str]:
         raise _error("input", "translated Markdown is not UTF-8") from exc
     except OSError as exc:
         raise _error("input", "translated Markdown could not be read") from exc
+
+
+def _validate_in_place_backup(
+    source: Path,
+    input_paths: Sequence[Path],
+    output: Path,
+    assets: Path,
+    report: Path,
+) -> Path:
+    """Preflight the recoverable backup before any in-place publication write."""
+
+    backup = source.with_name(source.name + ".bak")
+    try:
+        _reject_symlink_components(backup)
+        if backup.exists() and not backup.is_file():
+            raise _error("local_io", "in-place Markdown backup is not a file")
+    except RestorationError:
+        raise
+    except OSError as exc:
+        raise _error("local_io", "in-place Markdown backup could not be checked") from exc
+
+    resolved_inputs = tuple(_resolved_path(path, "input") for path in input_paths)
+    for target in (backup, output, assets, report):
+        for input_path in resolved_inputs:
+            # The explicit in-place exception is only for the Markdown output;
+            # the backup must never alias any input, including that Markdown.
+            if target == output == source == input_path:
+                continue
+            if (
+                target == input_path
+                or target.is_relative_to(input_path)
+                or input_path.is_relative_to(target)
+            ):
+                raise _error("input", "in-place backup or bundle collides with an input")
+    for target in (output, assets, report):
+        if target == backup or target.is_relative_to(backup) or backup.is_relative_to(target):
+            raise _error("input", "in-place backup collides with the output bundle")
+    return backup
 
 
 def _report_safe_text(value: object) -> str:
@@ -1118,6 +1156,8 @@ def restore_figures(
     manifest_file = _resolved_path(
         _coerce_path(manifest_path, "manifest"), "manifest"
     )
+    if len({pdf, markdown_file, manifest_file}) != 3:
+        raise _error("input", "PDF, Markdown, and manifest inputs must be distinct")
     if not pdf.is_file():
         raise _error("input", "PDF could not be read")
     output, assets, report = _bundle_paths(
@@ -1126,6 +1166,14 @@ def restore_figures(
         in_place=bool(in_place),
         input_paths=(pdf, markdown_file, manifest_file),
     )
+    if in_place:
+        _validate_in_place_backup(
+            markdown_file,
+            (pdf, markdown_file, manifest_file),
+            output,
+            assets,
+            report,
+        )
     _, markdown = _read_markdown(markdown_file)
     manifest = load_manifest(manifest_file)
 

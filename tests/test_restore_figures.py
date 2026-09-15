@@ -1397,3 +1397,77 @@ def test_cli_maps_validation_and_local_io_errors_without_tracebacks(
     assert local_io.returncode == 3
     assert "Traceback" not in local_io.stderr
     assert "SECRET_MARKDOWN" not in local_io.stderr
+
+
+@pytest.mark.parametrize("backup_input", ["manifest", "pdf"])
+def test_in_place_backup_rejects_input_collision_before_any_write(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+    backup_input: str,
+) -> None:
+    """Catches `.bak` creation overwriting a PDF or manifest input."""
+
+    markdown_path = tmp_path / "paper.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    backup_path = markdown_path.with_name("paper.md.bak")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_bytes = json.dumps(
+        {"version": 1, "figures": [{"id": "figure-1", "status": "skip", "reason": "decorative"}]}
+    ).encode("utf-8")
+    if backup_input == "manifest":
+        backup_path.write_bytes(manifest_bytes)
+        manifest_path = backup_path
+        pdf_path = controlled_pdf
+    else:
+        backup_path.write_bytes(controlled_pdf.read_bytes())
+        manifest_path.write_bytes(manifest_bytes)
+        pdf_path = backup_path
+    snapshots = {
+        markdown_path: markdown_path.read_bytes(),
+        backup_path: backup_path.read_bytes(),
+        manifest_path: manifest_path.read_bytes(),
+        pdf_path: pdf_path.read_bytes(),
+    }
+
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            pdf_path,
+            markdown_path,
+            manifest_path,
+            in_place=True,
+        )
+    assert caught.value.category == "input"
+    for path, contents in snapshots.items():
+        assert path.read_bytes() == contents
+
+
+def test_existing_in_place_backup_symlink_is_rejected_safely(
+    tmp_path: Path,
+    controlled_pdf: Path,
+    translated_markdown: str,
+) -> None:
+    """Catches copying an in-place backup through a symlink to an escape path."""
+
+    markdown_path = tmp_path / "paper.md"
+    markdown_path.write_text(translated_markdown, encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    backup_path = markdown_path.with_name("paper.md.bak")
+    backup_path.symlink_to(outside)
+    manifest_path = _manifest_file(
+        tmp_path,
+        [{"id": "figure-1", "status": "skip", "reason": "decorative"}],
+    )
+    source_bytes = markdown_path.read_bytes()
+
+    with pytest.raises(restorer.RestorationError) as caught:
+        restorer.restore_figures(
+            controlled_pdf,
+            markdown_path,
+            manifest_path,
+            in_place=True,
+        )
+    assert caught.value.category == "local_io"
+    assert markdown_path.read_bytes() == source_bytes
+    assert outside.read_text(encoding="utf-8") == "outside"
