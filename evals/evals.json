@@ -1,0 +1,47 @@
+{
+  "skill_name": "paper-translation-figure-restorer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have an original academic PDF and an existing translated Markdown paper whose figure locations are caption-only placeholders. Restore every substantive figure, including pages that mix vector diagrams and raster panels, while keeping the translation intact. Select complete crops by visually inspecting the source and deliver a portable Markdown bundle with a coverage report.",
+      "expected_output": "A non-destructive Markdown output with one complete, readable asset and marked insertion for each restored figure, plus a portable coverage report. The source Markdown remains unchanged.",
+      "files": [],
+      "expectations": [
+        "The existing translated prose, captions, formulas, and other non-generated Markdown bytes are preserved without retranslation.",
+        "Every substantive PDF figure is explicitly accounted for as restore, already-present, skip with a reason, or blocked with a reason.",
+        "The model visually inspects each relevant PDF page and each generated crop; mixed vector and raster figure content is complete and unrelated body text is excluded.",
+        "Each restored figure has exactly one marker-delimited block and one portable relative image link, with no duplicate assets or blocks.",
+        "All generated links resolve inside a sibling asset directory and the output and report use portable relative names.",
+        "The workflow processes the supplied files locally and makes no external service or API call."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Some figures in my translated Markdown are already linked, while other figure captions have no image. The document also contains a good structured Markdown table that must stay a table. Using the authoritative PDF, verify the existing assets, restore only missing substantive figures, and publish a non-destructive portable bundle and audit report.",
+      "expected_output": "A bundle that verifies and preserves existing images, inserts only missing figures, keeps the structured table byte-identical, and reports complete figure coverage with portable links.",
+      "files": [],
+      "expectations": [
+        "The existing translated prose and the structured Markdown table are preserved byte-for-byte outside generated image blocks.",
+        "Already-present figures are verified and reported without copying, replacing, or duplicating their existing assets.",
+        "Missing substantive PDF figures are restored and every PDF figure is explicitly accounted for as restore, already-present, skip with a reason, or blocked with a reason.",
+        "The model visually inspects all selected pages and crops, and each restored crop contains the complete figure without adjacent captions or body text leaking in.",
+        "Each figure appears once at its matching caption with one marker block; all relative links resolve within the portable sibling bundle.",
+        "No unnecessary retranslation or prose rewrite occurs, and the helper does not call an external service."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "The PDF has two figures on the same page, but the translated captions have mismatched numbering and the visual-to-caption mapping is ambiguous. Reconcile the PDF and Markdown inventories without guessing, restore only mappings that are certain, and produce a report that makes any unresolved work explicit.",
+      "expected_output": "A safe non-destructive bundle in which unambiguous figures are restored once and ambiguous items are blocked with prominent reasons; the report says the result is incomplete when blocked work remains.",
+      "files": [],
+      "expectations": [
+        "The model visually inspects the shared page and independently reconciles figure identity, numbering, captions, and boundaries before inserting anything.",
+        "An ambiguous or mismatched mapping becomes blocked with a prominent reason instead of being guessed or silently omitted.",
+        "When any figure is blocked, the coverage report says INCOMPLETE and the operation does not claim complete coverage.",
+        "Every unambiguous PDF figure is accounted for and appears at most once with no duplicate marker block or asset.",
+        "The original prose, captions, formulas, and structured tables remain unchanged outside generated blocks, with no unnecessary retranslation.",
+        "Any published image links are portable relative links inside the sibling asset directory, and no external call is made."
+      ]
+    }
+  ]
+}
