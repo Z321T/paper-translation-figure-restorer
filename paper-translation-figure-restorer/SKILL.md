@@ -5,6 +5,8 @@ description: Use when the user asks to add, restore, recover, or repair missing 
 
 # Paper Translation Figure Restorer
 
+Release: 0.1.0
+
 Use this skill only as a post-translation repair workflow. The translated
 Markdown is already translated and is the document being preserved; the
 original PDF is authoritative for figure identity, numbering, visual content,

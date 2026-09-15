@@ -171,6 +171,77 @@ def test_cli_contract_default_output_and_project_metadata() -> None:
     assert "pytest>=9.1.1" in dev_dependencies
 
 
+def test_readme_declares_exactly_two_document_inputs_and_post_translation_boundary() -> None:
+    """Catches release docs that blur restoration into a third translation input."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+    assert re.search(r"exactly\s+two\s+document\s+inputs", readme)
+    assert re.search(r"original\s+academic\s+pdf", readme)
+    assert re.search(r"existing\s+translated\s+markdown", readme)
+    assert re.search(r"manifest.{0,180}(?:control|derived|generated)", readme, re.S)
+    assert re.search(r"post[- ]translation", readme)
+    assert re.search(r"not\s+(?:for|a)\s+translat(?:ing|ion).{0,80}from\s+scratch", readme, re.S)
+
+
+def test_readme_documents_local_only_visual_first_usage_and_safe_default_outputs() -> None:
+    """Catches a release README that omits prerequisites, safety, or the visual audit."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    lowered = readme.lower()
+
+    assert re.search(r"prerequisite", lowered)
+    assert re.search(r"python\s*>=?\s*3\.12", lowered)
+    assert "uv sync" in lowered
+    assert "local-only" in lowered
+    assert re.search(r"do not (?:call|use)\s+mineru", lowered)
+    assert re.search(r"no\s+(?:external\s+)?(?:api|service|network)", lowered)
+    assert re.search(r"visual[- ]first.{0,180}manifest", lowered, re.S)
+    assert re.search(r"visually\s+inspect\s+every\s+pdf\s+page", lowered)
+    assert re.search(r"deterministic\s+(?:executor|helper)", lowered)
+    assert re.search(r"not\s+(?:evidence|proof).{0,100}complete", lowered, re.S)
+    assert re.search(r"default.{0,120}_with_figures\.md", readme, re.I | re.S)
+    assert re.search(r"(?:leave|keep|preserve).{0,100}(?:source|input)\s+markdown.{0,80}(?:unchanged|untouched)", lowered, re.S)
+    assert re.search(r"paper[- ]specific.{0,180}(?:bbox|bounding box|coordinate)", lowered, re.S)
+
+
+def test_readme_includes_practical_cli_and_portable_bundle_layout() -> None:
+    """Catches docs that describe the idea but leave installation and handoff ambiguous."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    lowered = readme.lower()
+
+    assert re.search(
+        r"restore_figures\.py\s+pdf\s+markdown\s+manifest\s+\[--output\s+path\]\s+\[--dpi\s+n\]\s+\[--in-place\]",
+        readme,
+        re.I,
+    )
+    assert "paper_with_figures.md" in readme
+    assert "paper_with_figures_assets/" in readme
+    assert "paper_with_figures_figure_report.md" in readme
+    assert re.search(r"relative\s+posix", lowered)
+    assert re.search(r"path\s+traversal", lowered)
+    assert re.search(r"structured\s+markdown\s+table", lowered)
+    assert re.search(r"--in-place.{0,140}(?:backup|recoverable|explicit)", lowered, re.S)
+
+
+def test_release_version_is_consistent_across_readme_metadata_and_skill() -> None:
+    """Catches publishing documentation that advertises a different release."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    skill = SKILL.read_text(encoding="utf-8")
+    metadata = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    expected = metadata["project"]["version"]
+    assert expected == "0.1.0"
+
+    for label, text in (("README", readme), ("SKILL", skill)):
+        match = re.search(
+            r"(?im)^\s*(?:release|version)\s*:\s*(\d+\.\d+\.\d+)\s*$",
+            text,
+        )
+        assert match, f"{label} must state the release version"
+        assert match.group(1) == expected
+
+
 def test_manifest_reference_defines_version_one_state_fields() -> None:
     text = REFERENCE.read_text(encoding="utf-8")
     lowered = text.lower()
