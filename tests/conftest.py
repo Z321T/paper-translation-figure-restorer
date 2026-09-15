@@ -19,7 +19,7 @@ if str(SCRIPTS) not in sys.path:
 def controlled_pdf(tmp_path: Path) -> Path:
     """Create a two-page PDF containing only page-native vector figures."""
 
-    path = tmp_path / "controlled-paper.pdf"
+    path = tmp_path / "controlled-document.pdf"
     document = fitz.open()
     try:
         page_one = document.new_page(width=360, height=260)
